@@ -1,0 +1,73 @@
+name: Build iOS - Claude Discovery Alternative
+
+on:
+  push:
+    branches:
+      - claude-discovery-build
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+
+      - name: Select Xcode 16.4
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -version
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Expo prebuild
+        run: npx expo prebuild --platform ios --no-install
+
+      - name: Install CocoaPods
+        run: |
+          cd ios
+          pod install
+
+      - name: Build unsigned archive
+        run: |
+          cd ios
+          xcodebuild archive \
+            -workspace "STBRemote.xcworkspace" \
+            -scheme "STBRemote" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/STBRemote-Claude.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            DEVELOPMENT_TEAM=""
+
+      - name: Package unsigned IPA
+        run: |
+          APP_PATH=$(find "$RUNNER_TEMP/STBRemote-Claude.xcarchive/Products/Applications" -maxdepth 1 -type d -name "*.app" -print -quit)
+          test -n "$APP_PATH"
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$APP_PATH" "$RUNNER_TEMP/Payload/"
+          cd "$RUNNER_TEMP"
+          zip -r "StbRemote-Claude-unsigned.ipa" Payload
+
+      - name: Upload Claude IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: StbRemote-Claude-unsigned-ipa
+          path: ${{ runner.temp }}/StbRemote-Claude-unsigned.ipa
+          retention-days: 14
