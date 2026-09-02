@@ -18,7 +18,15 @@ type Socket = {
 type Dgram = { createSocket: (options: { type: "udp4" }) => Socket };
 
 const HI_HTTP_PORTS = [2015, 8867];
-const HI_DESCRIPTION_PATHS = ["/desc.xml", "/description.xml", "/device.xml"];
+const HI_DESCRIPTION_PATHS = [
+  "/description.xml",
+  "/desc.xml",
+  "/rootDesc.xml",
+  "/device.xml",
+  "/upnp/description.xml",
+  "/",
+];
+const SEARCH_TARGETS = [MULTISCREEN_DEVICE_TYPE, "upnp:rootdevice", "ssdp:all"];
 
 function loadDgram(): Dgram | null {
   if (Platform.OS === "web") return null;
@@ -30,16 +38,19 @@ function loadDgram(): Dgram | null {
   }
 }
 
-function decodeMessage(bytes: Uint8Array) { return new TextDecoder().decode(bytes); }
+function decodeMessage(bytes: Uint8Array) {
+  return new TextDecoder().decode(bytes);
+}
+
 function header(text: string, name: string) {
   const match = text.match(new RegExp(`^${name}:\\s*(.+)$`, "im"));
   return match?.[1]?.trim();
 }
-function normalizeHost(host: string) { return host.trim().replace(/^\[|\]$/g, ""); }
-function buildSearchRequest(st = MULTISCREEN_DEVICE_TYPE) {
+
+function buildSearchRequest(st: string, hostHeader: string) {
   return new TextEncoder().encode([
     "M-SEARCH * HTTP/1.1",
-    "HOST: 239.255.255.250:1900",
+    `HOST: ${hostHeader}`,
     'MAN: "ssdp:discover"',
     "MX: 1",
     `ST: ${st}`,
@@ -48,12 +59,20 @@ function buildSearchRequest(st = MULTISCREEN_DEVICE_TYPE) {
   ].join("\r\n"));
 }
 
+function normalizeHost(host: string) {
+  return host.trim().replace(/^\[|\]$/g, "");
+}
+
 async function fetchWithTimeout(url: string, timeoutMs: number): Promise<Response | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try { return await fetch(url, { signal: controller.signal }); }
-  catch { return null; }
-  finally { clearTimeout(timer); }
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function parseDescription(host: string, url: string, server?: string): Promise<StbDevice | null> {
@@ -61,7 +80,11 @@ async function parseDescription(host: string, url: string, server?: string): Pro
   if (!response) return null;
 
   let body = "";
-  try { body = await response.text(); } catch { return null; }
+  try {
+    body = await response.text();
+  } catch {
+    return null;
+  }
   if (!/<(?:root|device)\b/i.test(body) || !/<serviceType>/i.test(body)) return null;
 
   const parsed = parseDeviceDescription(body, url);
@@ -106,7 +129,6 @@ async function ssdpSearch(destinations: string[], timeoutMs: number) {
 
   const socket = dgram.createSocket({ type: "udp4" });
   const responses = new Map<string, { location?: string; server?: string }>();
-  const request = buildSearchRequest();
 
   return new Promise<Map<string, { location?: string; server?: string }>>((resolve) => {
     let finished = false;
@@ -119,19 +141,32 @@ async function ssdpSearch(destinations: string[], timeoutMs: number) {
 
     socket.on("message", (message, remote) => {
       const text = decodeMessage(message);
+      const server = header(text, "SERVER");
+      const st = header(text, "ST");
+      const usn = header(text, "USN");
+      const isHi = isHiMultiScreen(text, server) || st === MULTISCREEN_DEVICE_TYPE || /HiMultiScreen/i.test(usn ?? "");
+      if (!isHi) return;
       responses.set(normalizeHost(remote.address), {
         location: header(text, "LOCATION"),
-        server: header(text, "SERVER"),
+        server,
       });
     });
 
     socket.bind(0, "0.0.0.0", () => {
       for (const destination of destinations) {
-        socket.send(request, 0, request.length, 1900, destination, () => undefined);
+        const hostHeader = destination === "239.255.255.250" ? "239.255.255.250:1900" : `${destination}:1900`;
+        for (const st of SEARCH_TARGETS) {
+          const request = buildSearchRequest(st, hostHeader);
+          socket.send(request, 0, request.length, 1900, destination, () => undefined);
+        }
       }
     });
     setTimeout(finish, timeoutMs);
   });
+}
+
+function isHiMultiScreen(text: string, server?: string) {
+  return /HiMultiScreen|HiMultiScreenHTTP|multiscreen|VinputControlServer|MirrorControlServer|AccessControlServer/i.test(`${server ?? ""}\n${text}`);
 }
 
 async function httpSubnetProbe(localIp: string): Promise<StbDevice[]> {
@@ -142,8 +177,7 @@ async function httpSubnetProbe(localIp: string): Promise<StbDevice[]> {
   const found = new Map<string, StbDevice>();
 
   for (let i = 0; i < hosts.length; i += 16) {
-    const batch = hosts.slice(i, i + 16);
-    const results = await Promise.all(batch.map(async (host) => {
+    const results = await Promise.all(hosts.slice(i, i + 16).map(async (host) => {
       for (const port of HI_HTTP_PORTS) {
         for (const path of HI_DESCRIPTION_PATHS) {
           const device = await parseDescription(host, `http://${host}:${port}${path}`, "HiMultiScreenHTTP");
@@ -159,38 +193,31 @@ async function httpSubnetProbe(localIp: string): Promise<StbDevice[]> {
   return [...found.values()];
 }
 
-export async function discoverHiSiliconStbs(timeoutMs = 1800): Promise<StbDevice[]> {
+export async function discoverHiSiliconStbs(timeoutMs = 3000): Promise<StbDevice[]> {
   const responses = await ssdpSearch(["239.255.255.250"], timeoutMs);
-
-  const devices: StbDevice[] = [];
-  for (const [host, info] of responses) {
-    const device = await resolveDevice(host, info.location, info.server);
-    if (device) devices.push(device);
-  }
-  if (devices.length) return devices;
+  const multicastDevices = (await Promise.all(
+    Array.from(responses.entries()).map(([host, info]) => resolveDevice(host, info.location, info.server)),
+  )).filter((device): device is StbDevice => Boolean(device));
+  if (multicastDevices.length > 0) return multicastDevices;
 
   try {
     const localIp = await Network.getIpAddressAsync();
-    if (/^\d+\.\d+\.\d+\.\d+$/.test(localIp)) {
-      // First try unicast SSDP, then HTTP descriptor probing for firmware that
-      // exposes HiMultiScreenHTTP but does not answer M-SEARCH.
-      const parts = localIp.split(".");
-      const prefix = parts.slice(0, 3).join(".");
-      const hosts = Array.from({ length: 254 }, (_, i) => `${prefix}.${i + 1}`).filter((ip) => ip !== localIp);
-      for (let i = 0; i < hosts.length; i += 64) {
-        const batch = await ssdpSearch(hosts.slice(i, i + 64), 500);
-        for (const [host, info] of batch) {
-          const device = await resolveDevice(host, info.location, info.server);
-          if (device) devices.push(device);
-        }
-        if (devices.length) return devices;
-      }
+    if (!localIp || !/^\d+\.\d+\.\d+\.\d+$/.test(localIp)) return [];
 
-      return await httpSubnetProbe(localIp);
+    const parts = localIp.split(".");
+    const prefix = parts.slice(0, 3).join(".");
+    const destinations = Array.from({ length: 254 }, (_, i) => `${prefix}.${i + 1}`).filter((ip) => ip !== localIp);
+
+    for (let i = 0; i < destinations.length; i += 64) {
+      const batch = await ssdpSearch(destinations.slice(i, i + 64), 500);
+      const batchDevices = (await Promise.all(
+        Array.from(batch.entries()).map(([host, info]) => resolveDevice(host, info.location, info.server)),
+      )).filter((device): device is StbDevice => Boolean(device));
+      if (batchDevices.length > 0) return batchDevices;
     }
-  } catch {
-    // No usable local IPv4 address.
-  }
 
-  return [];
+    return await httpSubnetProbe(localIp);
+  } catch {
+    return [];
+  }
 }
