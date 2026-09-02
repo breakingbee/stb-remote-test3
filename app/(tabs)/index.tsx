@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ActivityIndicator,
   Alert,
   Modal,
   PanResponder,
@@ -14,44 +15,42 @@ import {
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
 import { ScreenContainer } from "@/components/screen-container";
-import { DEFAULT_KEYS, KeyCode, MOCK_DEVICE, MouseClickType, type KeyAction, type StbDevice } from "@/lib/stb-protocol";
-import { VinputTransport } from "@/lib/vinput-transport";
+import { accessHello, getOrCreateRemoteId } from "@/lib/access-control";
+import { getMirrorCapability, startMirror } from "@/lib/mirror-control";
 import { discoverHiSiliconStbs } from "@/lib/upnp-discovery";
 import { resolveVinputEndpoint, startVinput } from "@/lib/vinput-control";
-import { accessHello } from "@/lib/access-control";
-import { getMirrorCapability, startMirror } from "@/lib/mirror-control";
+import { DEFAULT_KEYS, KeyCode, MouseClickType, type KeyAction, type StbDevice } from "@/lib/stb-protocol";
+import { VinputTransport } from "@/lib/vinput-transport";
 
-/** Digit '0'..'9' -> real STB keycode (KeyInfo.KEYCODE_0.._9). '0' is 11, not "7 + digit". */
-function digitKeyCode(digit: string): number {
-  const n = Number(digit);
-  return n === 0 ? KeyCode.DIGIT_0 : KeyCode.DIGIT_1 + (n - 1);
-}
-
-const COLORS = {
-  background: "#0B1118",
-  surface: "#131D28",
-  elevated: "#1B2938",
-  text: "#F5F8FB",
-  muted: "#9AAABD",
-  blue: "#5B9BFF",
-  blueDeep: "#2D7FF9",
-  green: "#48D597",
-  border: "#273747",
-  red: "#F07A83",
-  yellow: "#F0C75E",
+const C = {
+  bg: "#121212",
+  panel: "#202020",
+  panel2: "#2A2A2A",
+  key: "#343434",
+  keyPressed: "#548E08",
+  green: "#78B916",
+  greenDark: "#4F8507",
+  text: "#FFFFFF",
+  muted: "#B7B7B7",
+  black: "#090909",
+  red: "#E02020",
+  orange: "#D98200",
+  blue: "#1D79C3",
 };
 
-type ControlProps = {
+function digitKeyCode(digit: string) {
+  const n = Number(digit);
+  return n === 0 ? KeyCode.DIGIT_0 : KeyCode.DIGIT_1 + n - 1;
+}
+
+function KeyButton({ label, onPress, onPressIn, onPressOut, wide = false, green = false }: {
   label: string;
-  symbol?: string;
   onPress: () => void;
   onPressIn?: () => void;
   onPressOut?: () => void;
-  tint?: string;
-  compact?: boolean;
-};
-
-function Control({ label, symbol, onPress, onPressIn, onPressOut, tint, compact }: ControlProps) {
+  wide?: boolean;
+  green?: boolean;
+}) {
   return (
     <Pressable
       accessibilityRole="button"
@@ -59,117 +58,97 @@ function Control({ label, symbol, onPress, onPressIn, onPressOut, tint, compact 
       onPress={onPress}
       onPressIn={onPressIn}
       onPressOut={onPressOut}
-      style={({ pressed }) => [
-        styles.control,
-        compact && styles.compactControl,
-        pressed && styles.pressed,
-      ]}
+      style={({ pressed }) => [styles.keyButton, wide && styles.keyButtonWide, green && styles.keyButtonGreen, pressed && styles.keyButtonPressed]}
     >
-      {symbol ? <Text style={[styles.controlSymbol, tint ? { color: tint } : null]}>{symbol}</Text> : null}
-      <Text style={styles.controlLabel}>{label}</Text>
+      <Text style={styles.keyText}>{label}</Text>
     </Pressable>
   );
 }
 
-function DirectionButton({ label, symbol, onPress }: { label: string; symbol: string; onPress: () => void }) {
+function ArrowButton({ label, symbol, onPress }: { label: string; symbol: string; onPress: () => void }) {
   return (
     <Pressable
       accessibilityRole="button"
       accessibilityLabel={label}
       onPress={onPress}
-      style={({ pressed }) => [styles.directionButton, pressed && styles.pressed]}
+      style={({ pressed }) => [styles.arrowButton, pressed && styles.keyButtonPressed]}
     >
-      <Text style={styles.directionSymbol}>{symbol}</Text>
+      <Text style={styles.arrowText}>{symbol}</Text>
     </Pressable>
   );
 }
 
 export default function HomeScreen() {
-  const [device, setDevice] = useState<StbDevice>(MOCK_DEVICE);
-  const [settingsVisible, setSettingsVisible] = useState(false);
-  const [lastAction, setLastAction] = useState("Ready");
-  const [screenMode, setScreenMode] = useState<"remote" | "trackpad" | "view">("remote");
-  const [hostText, setHostText] = useState(MOCK_DEVICE.host);
-  const [portText, setPortText] = useState("");
+  const [device, setDevice] = useState<StbDevice | null>(null);
+  const [scanPhase, setScanPhase] = useState("Starting local network scan…");
   const [discovering, setDiscovering] = useState(false);
-  const [channelPadVisible, setChannelPadVisible] = useState(false);
+  const [lastAction, setLastAction] = useState("Not connected");
+  const [mode, setMode] = useState<"remote" | "trackpad" | "view">("remote");
+  const [settingsVisible, setSettingsVisible] = useState(false);
+  const [channelVisible, setChannelVisible] = useState(false);
   const [channelText, setChannelText] = useState("");
+  const [hostText, setHostText] = useState("");
+  const [portText, setPortText] = useState("");
   const repeatTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  useEffect(() => {
-    Promise.all([
-      AsyncStorage.getItem("stb-remote.stb-host"),
-      AsyncStorage.getItem("stb-remote.vinput-port"),
-    ]).then(([storedHost, storedPort]) => {
-      const host = storedHost?.trim() || MOCK_DEVICE.host;
-      const port = Number(storedPort);
-      setHostText(host);
-      if (Number.isInteger(port) && port > 0 && port <= 65535) {
-        setDevice((current) => ({ ...current, host, vinput: { host, port, serviceName: "HI_UPNP_VAR_VinpuServerURI" } }));
-      } else {
-        setDevice((current) => ({ ...current, host }));
-      }
-    }).catch(() => undefined);
-  }, []);
-
-  const endpointReady = device.vinput?.port ? device.vinput.port > 0 : false;
-  const statusLabel = endpointReady ? "Ready to send" : "Discovery preview";
-  const endpointHost = device.vinput?.host ?? device.host;
-  const endpointPort = device.vinput?.port ?? 0;
-  const endpointServiceName = device.vinput?.serviceName;
-  const transport = useMemo(
-    () => new VinputTransport({ host: endpointHost, port: endpointPort, serviceName: endpointServiceName }),
-    [endpointHost, endpointPort, endpointServiceName],
-  );
-
+  const endpointHost = device?.vinput?.host ?? device?.host ?? "";
+  const endpointPort = device?.vinput?.port ?? 0;
+  const transport = useMemo(() => new VinputTransport({ host: endpointHost, port: endpointPort, serviceName: device?.vinput?.serviceName }), [endpointHost, endpointPort, device?.vinput?.serviceName]);
   useEffect(() => () => transport.close(), [transport]);
 
-  const mirrorCapability = useMemo(() => getMirrorCapability(device), [device]);
+  const connectFoundDevice = useCallback(async (found: StbDevice) => {
+    setScanPhase("Connecting to STB…");
+    const hello = await accessHello(found);
+    if (!hello.ok) throw new Error(`AccessHello failed: ${hello.error ?? "unknown"}`);
 
-  // Trackpad: relative-motion mouse (RemoteMouse.java). Drag to move the STB cursor,
-  // a short tap sends a left click, and a two-finger-style long hold sends right click.
-  const dragMoved = useRef(false);
-  const trackpadResponder = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onMoveShouldSetPanResponder: () => true,
-      onPanResponderGrant: () => {
-        dragMoved.current = false;
-      },
-      onPanResponderMove: (_event, gesture) => {
-        if (Math.abs(gesture.dx) > 2 || Math.abs(gesture.dy) > 2) dragMoved.current = true;
-        transport.sendMouseMove(gesture.vx * 24, gesture.vy * 24);
-      },
-      onPanResponderRelease: () => {
-        if (!dragMoved.current) {
-          transport.sendMouseClick(MouseClickType.LEFT_SINGLE_CLICK);
-          setLastAction("Left click sent");
-        } else {
-          setLastAction("Cursor moved");
-        }
-      },
-    }),
-  ).current;
+    setScanPhase("Starting remote control…");
+    const endpoint = await resolveVinputEndpoint(found);
+    await startVinput(found);
+
+    const connected = { ...found, vinput: endpoint };
+    setDevice(connected);
+    setHostText(connected.host);
+    await AsyncStorage.setItem("stb-remote.stb-host", connected.host);
+    await AsyncStorage.setItem("stb-remote.vinput-port", String(endpoint.port));
+    setLastAction(`Connected to ${connected.name}`);
+  }, []);
+
+  const discover = useCallback(async () => {
+    if (discovering) return;
+    setDiscovering(true);
+    setDevice(null);
+    try {
+      setScanPhase("Searching for HiMultiScreen devices…");
+      const devices = await discoverHiSiliconStbs();
+      if (!devices.length) throw new Error("No HiSilicon STB found on this Wi‑Fi network.");
+      setScanPhase(`Found ${devices[0].name || "HiSilicon STB"}. Establishing session…`);
+      await connectFoundDevice(devices[0]);
+    } catch (error) {
+      setLastAction("Discovery failed");
+      setScanPhase(error instanceof Error ? error.message : "Discovery failed");
+    } finally {
+      setDiscovering(false);
+    }
+  }, [connectFoundDevice, discovering]);
+
+  useEffect(() => {
+    getOrCreateRemoteId().catch(() => undefined);
+    discover();
+  }, [discover]);
 
   const sendKey = (action: KeyAction) => {
     const result = transport.sendTap(action.keyCode);
-    if (!endpointReady) {
-      setLastAction(`${action.label} · preview packet ready`);
-      return;
-    }
-    setLastAction(result.ok ? `${action.label} · sent over UDP` : `${action.label} · ${result.reason}`);
+    setLastAction(result.ok ? `${action.label} sent` : `${action.label}: ${result.reason}`);
   };
 
-  const key = useMemo(() => {
-    const byLabel = new Map(DEFAULT_KEYS.map((item) => [item.label, item]));
-    return (label: string): KeyAction => byLabel.get(label) ?? { label, keyCode: 0, symbol: "" };
+  const key = useCallback((label: string): KeyAction => {
+    return new Map(DEFAULT_KEYS.map((item) => [item.label, item])).get(label) ?? { label, keyCode: 0, symbol: label };
   }, []);
 
   const startRepeat = (action: KeyAction) => {
     sendKey(action);
-    repeatTimer.current = setInterval(() => sendKey(action), 180);
+    repeatTimer.current = setInterval(() => sendKey(action), 160);
   };
-
   const stopRepeat = () => {
     if (repeatTimer.current) {
       clearInterval(repeatTimer.current);
@@ -177,367 +156,301 @@ export default function HomeScreen() {
     }
   };
 
-  const discover = async () => {
-    setDiscovering(true);
-    setLastAction("Searching local network…");
-    try {
-      const devices = await discoverHiSiliconStbs();
-      const first = devices.find((item) => item.vinput) ?? devices[0];
-      if (!first) {
-        setLastAction("No multiscreen STB found");
-        Alert.alert("No STB found", "Make sure the iPhone and STB are on the same Wi‑Fi network.");
-        return;
-      }
-
-      // Resolve the real Vinput endpoint and pairing before committing to it, so the
-      // UI never shows "Ready" for a port that turned out to be unreachable.
-      const [helloResult, resolvedEndpoint] = await Promise.all([
-        accessHello(first),
-        resolveVinputEndpoint(first),
-      ]);
-      if (first.services?.vinput?.controlUrl) {
-        await startVinput(first).catch(() => undefined);
-      }
-
-      const resolved: StbDevice = { ...first, vinput: resolvedEndpoint };
-      setDevice(resolved);
-      setHostText(resolved.host);
-      await AsyncStorage.setItem("stb-remote.stb-host", resolved.host);
-      if (resolved.vinput?.port) await AsyncStorage.setItem("stb-remote.vinput-port", String(resolved.vinput.port));
-      setLastAction(helloResult.ok ? `Paired with ${resolved.name}` : `Found ${resolved.name} (unpaired — sending anyway)`);
-    } catch {
-      setLastAction("Discovery failed");
-      Alert.alert("Discovery failed", "The local-network permission may be denied, or the STB may not advertise its multiscreen service.");
-    } finally {
-      setDiscovering(false);
-    }
-  };
+  const dragMoved = useRef(false);
+  const trackpadResponder = useRef(PanResponder.create({
+    onStartShouldSetPanResponder: () => true,
+    onMoveShouldSetPanResponder: () => true,
+    onPanResponderGrant: () => { dragMoved.current = false; },
+    onPanResponderMove: (_event, gesture) => {
+      if (Math.abs(gesture.dx) > 2 || Math.abs(gesture.dy) > 2) dragMoved.current = true;
+      transport.sendMouseMove(gesture.vx * 24, gesture.vy * 24);
+    },
+    onPanResponderRelease: () => {
+      if (!dragMoved.current) transport.sendMouseClick(MouseClickType.LEFT_SINGLE_CLICK);
+    },
+  })).current;
 
   const sendChannel = () => {
-    if (!channelText) return;
-    for (const character of channelText) {
-      sendKey({ label: character, keyCode: digitKeyCode(character), symbol: character });
-    }
-    sendKey({ label: "OK", keyCode: KeyCode.ENTER, symbol: "○" });
+    for (const digit of channelText) sendKey({ label: digit, keyCode: digitKeyCode(digit), symbol: digit });
+    if (channelText) sendKey({ label: "OK", keyCode: KeyCode.ENTER, symbol: "OK" });
     setLastAction(`Channel ${channelText} sent`);
     setChannelText("");
-    setChannelPadVisible(false);
+    setChannelVisible(false);
   };
 
-  const saveEndpoint = () => {
+  const saveManual = async () => {
     const host = hostText.trim();
-    const port = Number(portText);
-    if (!host) {
-      Alert.alert("Invalid address", "Enter the STB IP address or hostname.");
+    const port = Number(portText || device?.vinput?.port || 8822);
+    if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
+      Alert.alert("Invalid endpoint", "Enter a valid STB IP address and Vinput port.");
       return;
     }
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      Alert.alert("Invalid port", "Enter a Vinput UDP port between 1 and 65535.");
-      return;
+    try {
+      const candidate: StbDevice = { id: `${host}-manual`, name: "HiSilicon STB", host, vinput: { host, port } };
+      await connectFoundDevice(candidate);
+      setSettingsVisible(false);
+    } catch (error) {
+      Alert.alert("Connection failed", error instanceof Error ? error.message : "Unable to connect.");
     }
-    setDevice((current) => ({ ...current, host, vinput: { host, port, serviceName: "HI_UPNP_VAR_VinpuServerURI" } }));
-    AsyncStorage.setItem("stb-remote.stb-host", host).catch(() => undefined);
-    AsyncStorage.setItem("stb-remote.vinput-port", String(port)).catch(() => undefined);
-    setPortText("");
-    setSettingsVisible(false);
-    setLastAction("Vinput endpoint saved");
   };
+
+  if (!device) {
+    return (
+      <ScreenContainer edges={["top", "left", "right", "bottom"]} containerClassName="bg-background">
+        <View style={styles.discoveryScreen}>
+          <View style={styles.discoveryLogo}>
+            <View style={styles.logoInner}><Text style={styles.logoCross}>◆</Text></View>
+          </View>
+          <Text style={styles.discoveryTitle}>STB Remote</Text>
+          <Text style={styles.discoverySubtitle}>HiControl compatible remote</Text>
+
+          <View style={styles.scannerCard}>
+            <ActivityIndicator size="large" color={C.green} />
+            <Text style={styles.scannerTitle}>{discovering ? "Scanning your network" : "STB not found"}</Text>
+            <Text style={styles.scannerPhase}>{scanPhase}</Text>
+            <View style={styles.scanLine}><View style={[styles.scanProgress, !discovering && { width: "100%" }]} /></View>
+            <Text style={styles.scannerHint}>The remote connects only after the STB is discovered and the control session is started.</Text>
+          </View>
+
+          {!discovering ? (
+            <>
+              <Pressable onPress={discover} style={({ pressed }) => [styles.primaryGreen, pressed && styles.keyButtonPressed]}>
+                <Text style={styles.primaryGreenText}>SCAN AGAIN</Text>
+              </Pressable>
+              <Pressable onPress={() => setSettingsVisible(true)} style={styles.secondaryDark}>
+                <Text style={styles.secondaryDarkText}>ENTER STB IP MANUALLY</Text>
+              </Pressable>
+            </>
+          ) : null}
+
+          <Modal visible={settingsVisible} transparent animationType="slide" onRequestClose={() => setSettingsVisible(false)}>
+            <View style={styles.modalBackdrop}>
+              <View style={styles.sheet}>
+                <Text style={styles.sheetTitle}>Connect manually</Text>
+                <Text style={styles.sheetLabel}>STB IP address</Text>
+                <TextInput value={hostText} onChangeText={setHostText} placeholder="192.168.1.11" placeholderTextColor={C.muted} style={styles.input} keyboardType="numbers-and-punctuation" />
+                <Text style={styles.sheetLabel}>Vinput UDP port</Text>
+                <TextInput value={portText} onChangeText={setPortText} placeholder="8822" placeholderTextColor={C.muted} style={styles.input} keyboardType="number-pad" />
+                <Pressable onPress={saveManual} style={styles.primaryGreen}><Text style={styles.primaryGreenText}>CONNECT</Text></Pressable>
+                <Pressable onPress={() => setSettingsVisible(false)}><Text style={styles.cancelText}>CANCEL</Text></Pressable>
+              </View>
+            </View>
+          </Modal>
+        </View>
+      </ScreenContainer>
+    );
+  }
+
+  const mirrorCapability = getMirrorCapability(device);
 
   return (
-    <ScreenContainer edges={["top", "left", "right", "bottom"]} containerClassName="bg-background" className="px-5">
-      <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
-        <View style={styles.headerRow}>
-          <View>
-            <Text style={styles.eyebrow}>LOCAL CONTROL</Text>
-            <Text style={styles.title}>STB Remote</Text>
+    <ScreenContainer edges={["top", "left", "right", "bottom"]} containerClassName="bg-background">
+      <ScrollView contentContainerStyle={styles.remoteScreen} showsVerticalScrollIndicator={false}>
+        <View style={styles.topBar}>
+          <View style={styles.deviceBadge}>
+            <View style={styles.deviceDot} />
+            <View>
+              <Text style={styles.deviceName}>{device.name}</Text>
+              <Text style={styles.deviceIp}>{device.host}</Text>
+            </View>
           </View>
-          <Pressable accessibilityRole="button" accessibilityLabel="Open connection settings" onPress={() => setSettingsVisible(true)} style={styles.settingsButton}>
-            <Text style={styles.settingsSymbol}>⋯</Text>
-          </Pressable>
+          <Pressable onPress={() => setSettingsVisible(true)} style={styles.gear}><Text style={styles.gearText}>⚙</Text></Pressable>
         </View>
 
-        <View style={styles.connectionCard}>
-          <View style={[styles.statusDot, endpointReady ? styles.statusReady : styles.statusIdle]} />
-          <View style={styles.connectionText}>
-            <Text style={styles.deviceName}>{device.name}</Text>
-            <Text style={styles.deviceMeta}>{device.host} · {statusLabel}</Text>
-          </View>
-          <Text style={styles.chevron}>›</Text>
+        <View style={styles.modeRow}>
+          {(["remote", "trackpad", "view"] as const).map((item) => (
+            <Pressable key={item} onPress={() => setMode(item)} style={[styles.modeTab, mode === item && styles.modeTabActive]}>
+              <Text style={[styles.modeTabText, mode === item && styles.modeTabTextActive]}>{item === "remote" ? "REMOTE" : item === "trackpad" ? "MOUSE" : "SCREEN"}</Text>
+            </Pressable>
+          ))}
         </View>
 
-        <View style={styles.modeSwitch}>
-          <Pressable onPress={() => setScreenMode("remote")} style={[styles.modeOption, screenMode === "remote" && styles.modeSelected]}>
-            <Text style={[styles.modeText, screenMode === "remote" && styles.modeSelectedText]}>Remote</Text>
-          </Pressable>
-          <Pressable onPress={() => setScreenMode("trackpad")} style={[styles.modeOption, screenMode === "trackpad" && styles.modeSelected]}>
-            <Text style={[styles.modeText, screenMode === "trackpad" && styles.modeSelectedText]}>Trackpad</Text>
-          </Pressable>
-          <Pressable onPress={() => setScreenMode("view")} style={[styles.modeOption, screenMode === "view" && styles.modeSelected]}>
-            <Text style={[styles.modeText, screenMode === "view" && styles.modeSelectedText]}>Screen View</Text>
-          </Pressable>
-        </View>
-
-        {screenMode === "trackpad" ? (
+        {mode === "trackpad" ? (
           <View style={styles.trackpadWrap}>
             <View {...trackpadResponder.panHandlers} style={styles.trackpadSurface}>
-              <Text style={styles.trackpadHint}>Drag to move · tap to click</Text>
+              <Text style={styles.trackpadIcon}>✋</Text>
+              <Text style={styles.trackpadText}>DRAG TO MOVE</Text>
+              <Text style={styles.trackpadSub}>Tap to click</Text>
             </View>
-            <View style={styles.trackpadButtons}>
-              <Pressable
-                onPress={() => {
-                  transport.sendMouseClick(MouseClickType.LEFT_SINGLE_CLICK);
-                  setLastAction("Left click sent");
-                }}
-                style={({ pressed }) => [styles.trackpadButton, pressed && styles.pressed]}
-              >
-                <Text style={styles.trackpadButtonText}>Left click</Text>
-              </Pressable>
-              <Pressable
-                onPress={() => {
-                  transport.sendMouseClick(MouseClickType.RIGHT_SINGLE_CLICK);
-                  setLastAction("Right click sent");
-                }}
-                style={({ pressed }) => [styles.trackpadButton, pressed && styles.pressed]}
-              >
-                <Text style={styles.trackpadButtonText}>Right click</Text>
-              </Pressable>
-              <Pressable
-                onPress={() => {
-                  transport.sendMouseWheel("up");
-                  setLastAction("Scroll up sent");
-                }}
-                style={({ pressed }) => [styles.trackpadButton, pressed && styles.pressed]}
-              >
-                <Text style={styles.trackpadButtonText}>Scroll ↑</Text>
-              </Pressable>
-              <Pressable
-                onPress={() => {
-                  transport.sendMouseWheel("down");
-                  setLastAction("Scroll down sent");
-                }}
-                style={({ pressed }) => [styles.trackpadButton, pressed && styles.pressed]}
-              >
-                <Text style={styles.trackpadButtonText}>Scroll ↓</Text>
-              </Pressable>
-            </View>
+            <View style={styles.twoCol}><KeyButton label="LEFT CLICK" onPress={() => transport.sendMouseClick(MouseClickType.LEFT_SINGLE_CLICK)} /><KeyButton label="RIGHT CLICK" onPress={() => transport.sendMouseClick(MouseClickType.RIGHT_SINGLE_CLICK)} /></View>
           </View>
-        ) : screenMode === "view" ? (
-          <View style={styles.viewEmptyState}>
-            <Text style={styles.viewIcon}>▣</Text>
-            <Text style={styles.viewTitle}>Screen View</Text>
-            <Text style={styles.viewBody}>
-              {mirrorCapability.controlAvailable
-                ? "The mirror session handshake (SetMirrorParameter / StartMirror / StopMirror) is fully implemented and can open a session on the STB."
-                : "Discover a device to enable the mirror-session handshake."}
-              {"\n\n"}
-              {mirrorCapability.reason}
-            </Text>
-            <Pressable
-              onPress={async () => {
-                if (!mirrorCapability.controlAvailable) {
-                  setLastAction("Discover a device first");
-                  return;
-                }
-                setLastAction("Requesting mirror session…");
-                const result = await startMirror(device);
-                setLastAction(result.ok ? "Mirror session requested (no video decode)" : "Mirror request failed");
-              }}
-              style={styles.primaryButton}
-            >
-              <Text style={styles.primaryButtonText}>Request mirror session</Text>
-            </Pressable>
+        ) : mode === "view" ? (
+          <View style={styles.screenCard}>
+            <Text style={styles.screenIcon}>▣</Text>
+            <Text style={styles.screenTitle}>SCREEN VIEW</Text>
+            <Text style={styles.screenBody}>{mirrorCapability.controlAvailable ? "Mirror control is available. Video decoding will be connected to the native H.264 receiver next." : mirrorCapability.reason}</Text>
+            <Pressable onPress={async () => {
+              if (!mirrorCapability.controlAvailable) return;
+              setLastAction("Starting mirror session…");
+              const result = await startMirror(device);
+              setLastAction(result.ok ? "Mirror session started" : "Mirror session failed");
+            }} style={styles.primaryGreen}><Text style={styles.primaryGreenText}>START SCREEN VIEW</Text></Pressable>
           </View>
         ) : (
           <>
-            <View style={styles.dpadWrap}>
-              <DirectionButton label="Move up" symbol="⌃" onPress={() => sendKey({ label: "Up", keyCode: KeyCode.DPAD_UP, symbol: "⌃" })} />
+            <View style={styles.functionRow}>
+              <KeyButton label="POWER" green onPress={() => sendKey({ label: "Power", keyCode: KeyCode.POWER, symbol: "⏻" })} />
+              <KeyButton label="HOME" onPress={() => sendKey({ label: "Home", keyCode: KeyCode.HOME, symbol: "⌂" })} />
+              <KeyButton label="BACK" onPress={() => sendKey({ label: "Back", keyCode: KeyCode.BACK, symbol: "↩" })} />
+              <KeyButton label="MENU" onPress={() => sendKey(key("Guide"))} />
+            </View>
+
+            <View style={styles.dpadPanel}>
+              <ArrowButton label="Up" symbol="▲" onPress={() => sendKey({ label: "Up", keyCode: KeyCode.DPAD_UP, symbol: "▲" })} />
               <View style={styles.dpadMiddle}>
-                <DirectionButton label="Move left" symbol="‹" onPress={() => sendKey({ label: "Left", keyCode: KeyCode.DPAD_LEFT, symbol: "‹" })} />
-                <Pressable accessibilityRole="button" accessibilityLabel="Select" onPress={() => sendKey({ label: "OK", keyCode: KeyCode.ENTER, symbol: "○" })} style={({ pressed }) => [styles.okButton, pressed && styles.pressed]}>
-                  <Text style={styles.okText}>OK</Text>
-                </Pressable>
-                <DirectionButton label="Move right" symbol="›" onPress={() => sendKey({ label: "Right", keyCode: KeyCode.DPAD_RIGHT, symbol: "›" })} />
+                <ArrowButton label="Left" symbol="◀" onPress={() => sendKey({ label: "Left", keyCode: KeyCode.DPAD_LEFT, symbol: "◀" })} />
+                <Pressable onPress={() => sendKey({ label: "OK", keyCode: KeyCode.ENTER, symbol: "OK" })} style={({ pressed }) => [styles.okButton, pressed && styles.keyButtonPressed]}><Text style={styles.okText}>OK</Text></Pressable>
+                <ArrowButton label="Right" symbol="▶" onPress={() => sendKey({ label: "Right", keyCode: KeyCode.DPAD_RIGHT, symbol: "▶" })} />
               </View>
-              <DirectionButton label="Move down" symbol="⌄" onPress={() => sendKey({ label: "Down", keyCode: KeyCode.DPAD_DOWN, symbol: "⌄" })} />
+              <ArrowButton label="Down" symbol="▼" onPress={() => sendKey({ label: "Down", keyCode: KeyCode.DPAD_DOWN, symbol: "▼" })} />
             </View>
 
-            <View style={styles.utilityRow}>
-              <Control label="Back" symbol="‹" onPress={() => sendKey({ label: "Back", keyCode: KeyCode.BACK, symbol: "‹" })} />
-              <Control label="Home" symbol="⌂" onPress={() => sendKey({ label: "Home", keyCode: KeyCode.HOME, symbol: "⌂" })} />
-              <Control label="Info" symbol="ⓘ" onPress={() => sendKey(key("Info"))} tint={COLORS.blue} />
-              <Control label="Guide" symbol="▤" onPress={() => sendKey(key("Guide"))} />
-            </View>
-            <Pressable accessibilityRole="button" accessibilityLabel="Open numeric channel keypad" onPress={() => setChannelPadVisible(true)} style={({ pressed }) => [styles.keypadButton, pressed && styles.pressed]}>
-              <Text style={styles.keypadIcon}>⌨</Text>
-              <Text style={styles.keypadText}>Enter channel number</Text>
-            </Pressable>
-
-            <View style={styles.sideControls}>
-              <View style={styles.sideGroup}>
-                <Text style={styles.groupLabel}>VOLUME</Text>
-                <Control label="Volume up" symbol="+" onPressIn={() => startRepeat(key("Volume +"))} onPressOut={stopRepeat} onPress={() => sendKey(key("Volume +"))} compact />
-                <Control label="Mute" symbol="⌁" onPress={() => sendKey(key("Mute"))} compact />
-                <Control label="Volume down" symbol="−" onPressIn={() => startRepeat(key("Volume −"))} onPressOut={stopRepeat} onPress={() => sendKey(key("Volume −"))} compact />
+            <View style={styles.avRow}>
+              <View style={styles.levelBlock}>
+                <Text style={styles.levelTitle}>VOLUME</Text>
+                <View style={styles.levelRow}>
+                  <KeyButton label="−" wide onPressIn={() => startRepeat(key("Volume −"))} onPressOut={stopRepeat} onPress={() => sendKey(key("Volume −"))} />
+                  <KeyButton label="MUTE" onPress={() => sendKey(key("Mute"))} />
+                  <KeyButton label="+" wide onPressIn={() => startRepeat(key("Volume +"))} onPressOut={stopRepeat} onPress={() => sendKey(key("Volume +"))} />
+                </View>
               </View>
-              <View style={styles.sideGroup}>
-                <Text style={styles.groupLabel}>CHANNEL</Text>
-                <Control label="Channel up" symbol="+" onPressIn={() => startRepeat(key("Channel +"))} onPressOut={stopRepeat} onPress={() => sendKey(key("Channel +"))} compact />
-                <Control label="Channel down" symbol="−" onPressIn={() => startRepeat(key("Channel −"))} onPressOut={stopRepeat} onPress={() => sendKey(key("Channel −"))} compact />
+              <View style={styles.levelBlock}>
+                <Text style={styles.levelTitle}>CHANNEL</Text>
+                <View style={styles.levelRow}>
+                  <KeyButton label="−" wide onPressIn={() => startRepeat(key("Channel −"))} onPressOut={stopRepeat} onPress={() => sendKey(key("Channel −"))} />
+                  <KeyButton label="+" wide onPressIn={() => startRepeat(key("Channel +"))} onPressOut={stopRepeat} onPress={() => sendKey(key("Channel +"))} />
+                </View>
               </View>
             </View>
 
-            <Text style={styles.sectionLabel}>MEDIA & COLOUR</Text>
+            <View style={styles.numericHeader}><Text style={styles.sectionTitle}>NUMBER PAD</Text><Pressable onPress={() => setChannelVisible(true)}><Text style={styles.linkText}>ENTER CHANNEL</Text></Pressable></View>
+            <View style={styles.numericGrid}>
+              {["1","2","3","4","5","6","7","8","9","0"].map((digit) => <KeyButton key={digit} label={digit} onPress={() => sendKey({ label: digit, keyCode: digitKeyCode(digit), symbol: digit })} />)}
+              <KeyButton label="INFO" onPress={() => sendKey(key("Info"))} />
+              <KeyButton label="GUIDE" onPress={() => sendKey(key("Guide"))} />
+            </View>
+
             <View style={styles.mediaRow}>
-              <Control label="Play" symbol="▶" onPress={() => sendKey({ label: "Play", keyCode: KeyCode.PLAY, symbol: "▶" })} compact />
-              <Control label="Stop" symbol="■" onPress={() => sendKey({ label: "Stop", keyCode: KeyCode.STOP, symbol: "■" })} compact />
-              <Control label="Previous" symbol="⏮" onPress={() => sendKey({ label: "Previous", keyCode: KeyCode.PREVIOUS, symbol: "⏮" })} compact />
-              <Control label="Next" symbol="⏭" onPress={() => sendKey({ label: "Next", keyCode: KeyCode.NEXT, symbol: "⏭" })} compact />
+              <KeyButton label="PREV" onPress={() => sendKey({ label: "Previous", keyCode: KeyCode.PREVIOUS, symbol: "⏮" })} />
+              <KeyButton label="PLAY" green onPress={() => sendKey({ label: "Play", keyCode: KeyCode.PLAY, symbol: "▶" })} />
+              <KeyButton label="STOP" onPress={() => sendKey({ label: "Stop", keyCode: KeyCode.STOP, symbol: "■" })} />
+              <KeyButton label="NEXT" onPress={() => sendKey({ label: "Next", keyCode: KeyCode.NEXT, symbol: "⏭" })} />
             </View>
+
             <View style={styles.colorRow}>
-              {[{ label: "Red", keyCode: KeyCode.RED, color: COLORS.red }, { label: "Green", keyCode: KeyCode.GREEN, color: COLORS.green }, { label: "Yellow", keyCode: KeyCode.YELLOW, color: COLORS.yellow }, { label: "Blue", keyCode: KeyCode.BLUE, color: COLORS.blue }].map((item) => (
-                <Pressable key={item.label} accessibilityRole="button" accessibilityLabel={item.label} onPress={() => sendKey({ ...item, symbol: "●" })} style={({ pressed }) => [styles.colorButton, { borderColor: item.color }, pressed && styles.pressed]}>
-                  <Text style={[styles.colorDot, { color: item.color }]}>●</Text>
-                  <Text style={styles.colorLabel}>{item.label}</Text>
-                </Pressable>
-              ))}
+              <KeyButton label="RED" onPress={() => sendKey({ label: "Red", keyCode: KeyCode.RED, symbol: "●" })} />
+              <KeyButton label="GREEN" green onPress={() => sendKey({ label: "Green", keyCode: KeyCode.GREEN, symbol: "●" })} />
+              <KeyButton label="YELLOW" onPress={() => sendKey({ label: "Yellow", keyCode: KeyCode.YELLOW, symbol: "●" })} />
+              <KeyButton label="BLUE" onPress={() => sendKey({ label: "Blue", keyCode: KeyCode.BLUE, symbol: "●" })} />
             </View>
           </>
         )}
 
         <View style={styles.statusBar}>
-          <View style={styles.statusBarDot} />
-          <Text style={styles.statusBarText}>{lastAction}</Text>
-          <Text style={styles.packetHint}>{endpointReady ? `${device.vinput?.port} / UDP` : "Protocol preview"}</Text>
+          <View style={styles.deviceDot} />
+          <Text style={styles.statusText}>{lastAction}</Text>
+          <Text style={styles.statusPort}>{device.vinput?.port}/UDP</Text>
         </View>
       </ScrollView>
 
-      <Modal visible={channelPadVisible} animationType="slide" transparent onRequestClose={() => setChannelPadVisible(false)}>
-        <View style={styles.modalBackdrop}>
-          <View style={styles.sheet}>
-            <View style={styles.sheetHandle} />
-            <Text style={styles.sheetTitle}>Channel number</Text>
-            <Text style={styles.channelDisplay}>{channelText || "—"}</Text>
-            <View style={styles.numberGrid}>
-              {["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"].map((digit) => (
-                <Pressable key={digit} accessibilityRole="button" accessibilityLabel={`Digit ${digit}`} onPress={() => setChannelText((current) => `${current}${digit}`.slice(0, 4))} style={({ pressed }) => [styles.numberButton, pressed && styles.pressed]}>
-                  <Text style={styles.numberText}>{digit}</Text>
-                </Pressable>
-              ))}
-              <Pressable accessibilityRole="button" accessibilityLabel="Delete last digit" onPress={() => setChannelText((current) => current.slice(0, -1))} style={({ pressed }) => [styles.numberButton, pressed && styles.pressed]}>
-                <Text style={styles.numberText}>⌫</Text>
-              </Pressable>
-              <Pressable accessibilityRole="button" accessibilityLabel="Clear channel number" onPress={() => setChannelText("")} style={({ pressed }) => [styles.numberButton, pressed && styles.pressed]}>
-                <Text style={styles.numberText}>C</Text>
-              </Pressable>
-            </View>
-            <Pressable disabled={!channelText} onPress={sendChannel} style={[styles.primaryButton, !channelText && styles.disabledButton]}>
-              <Text style={styles.primaryButtonText}>Send channel</Text>
-            </Pressable>
-            <Pressable onPress={() => setChannelPadVisible(false)} style={styles.cancelButton}><Text style={styles.cancelText}>Close</Text></Pressable>
-          </View>
-        </View>
+      <Modal visible={channelVisible} transparent animationType="slide" onRequestClose={() => setChannelVisible(false)}>
+        <View style={styles.modalBackdrop}><View style={styles.sheet}>
+          <Text style={styles.sheetTitle}>Enter channel</Text>
+          <Text style={styles.channelBig}>{channelText || "—"}</Text>
+          <View style={styles.numericGrid}>{["1","2","3","4","5","6","7","8","9","0"].map((d) => <KeyButton key={d} label={d} onPress={() => setChannelText((v) => `${v}${d}`.slice(0,4))} />)}</View>
+          <Pressable onPress={sendChannel} style={styles.primaryGreen}><Text style={styles.primaryGreenText}>SEND</Text></Pressable>
+          <Pressable onPress={() => setChannelVisible(false)}><Text style={styles.cancelText}>CANCEL</Text></Pressable>
+        </View></View>
       </Modal>
 
-      <Modal visible={settingsVisible} animationType="slide" transparent onRequestClose={() => setSettingsVisible(false)}>
-        <View style={styles.modalBackdrop}>
-          <View style={styles.sheet}>
-            <View style={styles.sheetHandle} />
-            <Text style={styles.sheetTitle}>Connection</Text>
-            <Text style={styles.sheetSubtitle}>The reference remote discovers this endpoint through UPnP Vinput service metadata.</Text>
-            <Pressable onPress={discover} disabled={discovering} style={styles.secondaryButton}>
-              <Text style={styles.secondaryButtonText}>{discovering ? "Searching…" : "Discover STB on Wi‑Fi"}</Text>
-            </Pressable>
-            <Text style={styles.inputLabel}>STB address</Text>
-            <TextInput value={hostText} onChangeText={setHostText} autoCapitalize="none" autoCorrect={false} keyboardType="numbers-and-punctuation" placeholder="192.168.1.11" placeholderTextColor={COLORS.muted} style={styles.input} />
-            <Text style={styles.inputLabel}>Vinput UDP port</Text>
-            <TextInput value={portText} onChangeText={setPortText} keyboardType="number-pad" placeholder={device.vinput?.port ? String(device.vinput.port) : "Discovered automatically"} placeholderTextColor={COLORS.muted} style={styles.input} />
-            <Pressable onPress={saveEndpoint} style={styles.primaryButton}>
-              <Text style={styles.primaryButtonText}>Save endpoint</Text>
-            </Pressable>
-            <Pressable onPress={() => setSettingsVisible(false)} style={styles.cancelButton}>
-              <Text style={styles.cancelText}>Close</Text>
-            </Pressable>
-          </View>
-        </View>
+      <Modal visible={settingsVisible} transparent animationType="slide" onRequestClose={() => setSettingsVisible(false)}>
+        <View style={styles.modalBackdrop}><View style={styles.sheet}>
+          <Text style={styles.sheetTitle}>STB CONNECTION</Text>
+          <Text style={styles.connectedLine}>CONNECTED · {device.host}</Text>
+          <Pressable onPress={() => { setSettingsVisible(false); discover(); }} style={styles.secondaryDark}><Text style={styles.secondaryDarkText}>SCAN AGAIN</Text></Pressable>
+          <Text style={styles.sheetLabel}>STB IP address</Text>
+          <TextInput value={hostText} onChangeText={setHostText} style={styles.input} placeholder="192.168.1.11" placeholderTextColor={C.muted} keyboardType="numbers-and-punctuation" />
+          <Text style={styles.sheetLabel}>Vinput UDP port</Text>
+          <TextInput value={portText} onChangeText={setPortText} style={styles.input} placeholder={String(device.vinput?.port ?? 8822)} placeholderTextColor={C.muted} keyboardType="number-pad" />
+          <Pressable onPress={saveManual} style={styles.primaryGreen}><Text style={styles.primaryGreenText}>RECONNECT</Text></Pressable>
+          <Pressable onPress={() => setSettingsVisible(false)}><Text style={styles.cancelText}>CANCEL</Text></Pressable>
+        </View></View>
       </Modal>
     </ScreenContainer>
   );
 }
 
 const styles = StyleSheet.create({
-  content: { paddingTop: 12, paddingBottom: 28 },
-  headerRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 18 },
-  eyebrow: { color: COLORS.blue, fontSize: 11, fontWeight: "800", letterSpacing: 1.5 },
-  title: { color: COLORS.text, fontSize: 32, fontWeight: "800", letterSpacing: -0.8, marginTop: 3 },
-  settingsButton: { width: 44, height: 44, borderRadius: 15, alignItems: "center", justifyContent: "center", backgroundColor: COLORS.surface, borderWidth: 1, borderColor: COLORS.border },
-  settingsSymbol: { color: COLORS.text, fontSize: 24, marginTop: -9, letterSpacing: 2 },
-  connectionCard: { flexDirection: "row", alignItems: "center", backgroundColor: COLORS.surface, borderRadius: 18, borderWidth: 1, borderColor: COLORS.border, padding: 16, marginBottom: 14 },
-  statusDot: { width: 11, height: 11, borderRadius: 6, marginRight: 12 },
-  statusReady: { backgroundColor: COLORS.green },
-  statusIdle: { backgroundColor: COLORS.yellow },
-  connectionText: { flex: 1 },
-  deviceName: { color: COLORS.text, fontSize: 16, fontWeight: "700" },
-  deviceMeta: { color: COLORS.muted, fontSize: 12, marginTop: 3 },
-  chevron: { color: COLORS.muted, fontSize: 28, fontWeight: "300" },
-  modeSwitch: { flexDirection: "row", padding: 4, borderRadius: 14, backgroundColor: COLORS.surface, marginBottom: 16 },
-  modeOption: { flex: 1, alignItems: "center", paddingVertical: 11, borderRadius: 11 },
-  modeSelected: { backgroundColor: COLORS.elevated },
-  modeText: { color: COLORS.muted, fontSize: 14, fontWeight: "700" },
-  modeSelectedText: { color: COLORS.text },
-  dpadWrap: { alignItems: "center", paddingVertical: 8, backgroundColor: COLORS.surface, borderRadius: 26, borderWidth: 1, borderColor: COLORS.border },
-  dpadMiddle: { flexDirection: "row", alignItems: "center", gap: 18, marginVertical: 8 },
-  directionButton: { width: 58, height: 52, alignItems: "center", justifyContent: "center", borderRadius: 17, backgroundColor: COLORS.elevated },
-  directionSymbol: { color: COLORS.text, fontSize: 30, lineHeight: 32 },
-  okButton: { width: 76, height: 76, borderRadius: 38, alignItems: "center", justifyContent: "center", backgroundColor: COLORS.blueDeep, shadowColor: COLORS.blue, shadowOpacity: 0.35, shadowRadius: 14, shadowOffset: { width: 0, height: 7 }, elevation: 6 },
-  okText: { color: "#FFFFFF", fontSize: 17, fontWeight: "800", letterSpacing: 0.5 },
-  pressed: { opacity: 0.72, transform: [{ scale: 0.97 }] },
-  utilityRow: { flexDirection: "row", gap: 8, marginTop: 12 },
-  control: { flex: 1, minHeight: 68, alignItems: "center", justifyContent: "center", borderRadius: 17, backgroundColor: COLORS.surface, borderWidth: 1, borderColor: COLORS.border, paddingHorizontal: 6 },
-  compactControl: { minHeight: 56 },
-  controlSymbol: { color: COLORS.text, fontSize: 23, lineHeight: 25, fontWeight: "600" },
-  controlLabel: { color: COLORS.muted, fontSize: 10, fontWeight: "700", marginTop: 5, textAlign: "center" },
-  sideControls: { flexDirection: "row", gap: 12, marginTop: 16 },
-  sideGroup: { flex: 1, gap: 8 },
-  groupLabel: { color: COLORS.muted, fontSize: 10, fontWeight: "800", letterSpacing: 1.3, marginBottom: 1 },
-  sectionLabel: { color: COLORS.muted, fontSize: 10, fontWeight: "800", letterSpacing: 1.3, marginTop: 20, marginBottom: 8 },
-  mediaRow: { flexDirection: "row", gap: 8 },
-  colorRow: { flexDirection: "row", gap: 8, marginTop: 8 },
-  colorButton: { flex: 1, minHeight: 58, alignItems: "center", justifyContent: "center", borderRadius: 16, backgroundColor: COLORS.surface, borderWidth: 1 },
-  colorDot: { fontSize: 20, lineHeight: 20 },
-  colorLabel: { color: COLORS.muted, fontSize: 10, fontWeight: "700", marginTop: 4 },
-  keypadButton: { flexDirection: "row", minHeight: 52, alignItems: "center", justifyContent: "center", gap: 9, backgroundColor: COLORS.elevated, borderRadius: 15, borderWidth: 1, borderColor: COLORS.border, marginTop: 12 },
-  keypadIcon: { color: COLORS.blue, fontSize: 20 },
-  keypadText: { color: COLORS.text, fontSize: 13, fontWeight: "800" },
-  channelDisplay: { color: COLORS.text, fontSize: 42, fontWeight: "800", textAlign: "center", paddingVertical: 16, letterSpacing: 4 },
-  numberGrid: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
-  numberButton: { width: "31.5%", minHeight: 52, alignItems: "center", justifyContent: "center", borderRadius: 14, backgroundColor: COLORS.elevated, borderWidth: 1, borderColor: COLORS.border },
-  numberText: { color: COLORS.text, fontSize: 20, fontWeight: "700" },
-  disabledButton: { opacity: 0.4 },
-  statusBar: { flexDirection: "row", alignItems: "center", marginTop: 18, paddingHorizontal: 4 },
-  statusBarDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: COLORS.green, marginRight: 8 },
-  statusBarText: { color: COLORS.muted, fontSize: 11, flex: 1 },
-  packetHint: { color: COLORS.muted, fontSize: 10, fontWeight: "700" },
-  trackpadWrap: { gap: 12 },
-  trackpadSurface: { minHeight: 320, borderRadius: 24, backgroundColor: COLORS.surface, borderWidth: 1, borderColor: COLORS.border, alignItems: "center", justifyContent: "center" },
-  trackpadHint: { color: COLORS.muted, fontSize: 13, fontWeight: "600" },
-  trackpadButtons: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
-  trackpadButton: { flexGrow: 1, minWidth: "47%", minHeight: 52, alignItems: "center", justifyContent: "center", borderRadius: 15, backgroundColor: COLORS.elevated, borderWidth: 1, borderColor: COLORS.border },
-  trackpadButtonText: { color: COLORS.text, fontSize: 13, fontWeight: "700" },
-  viewEmptyState: { alignItems: "center", justifyContent: "center", minHeight: 420, padding: 28, borderRadius: 24, backgroundColor: COLORS.surface, borderWidth: 1, borderColor: COLORS.border },
-  viewIcon: { color: COLORS.blue, fontSize: 42, marginBottom: 16 },
-  viewTitle: { color: COLORS.text, fontSize: 22, fontWeight: "800" },
-  viewBody: { color: COLORS.muted, fontSize: 14, lineHeight: 21, textAlign: "center", marginTop: 10, marginBottom: 24 },
-  primaryButton: { backgroundColor: COLORS.blueDeep, minHeight: 52, borderRadius: 16, alignItems: "center", justifyContent: "center", paddingHorizontal: 22, marginTop: 12 },
-  primaryButtonText: { color: "#FFFFFF", fontWeight: "800", fontSize: 14 },
-  secondaryButton: { backgroundColor: COLORS.elevated, minHeight: 48, borderRadius: 14, alignItems: "center", justifyContent: "center", paddingHorizontal: 18, marginBottom: 4, borderWidth: 1, borderColor: COLORS.border },
-  secondaryButtonText: { color: COLORS.blue, fontWeight: "800", fontSize: 13 },
-  modalBackdrop: { flex: 1, justifyContent: "flex-end", backgroundColor: "rgba(0,0,0,0.55)" },
-  sheet: { backgroundColor: COLORS.surface, borderTopLeftRadius: 26, borderTopRightRadius: 26, paddingHorizontal: 22, paddingTop: 12, paddingBottom: 34, borderWidth: 1, borderColor: COLORS.border },
-  sheetHandle: { alignSelf: "center", width: 42, height: 5, borderRadius: 3, backgroundColor: COLORS.border, marginBottom: 18 },
-  sheetTitle: { color: COLORS.text, fontSize: 24, fontWeight: "800" },
-  sheetSubtitle: { color: COLORS.muted, fontSize: 13, lineHeight: 19, marginTop: 6, marginBottom: 18 },
-  inputLabel: { color: COLORS.muted, fontSize: 11, fontWeight: "800", letterSpacing: 1, marginTop: 12, marginBottom: 7 },
-  input: { color: COLORS.text, backgroundColor: COLORS.elevated, borderRadius: 13, borderWidth: 1, borderColor: COLORS.border, paddingHorizontal: 14, paddingVertical: 13, fontSize: 15 },
-  cancelButton: { alignItems: "center", paddingVertical: 16 },
-  cancelText: { color: COLORS.muted, fontSize: 14, fontWeight: "700" },
+  discoveryScreen: { flex: 1, backgroundColor: C.bg, paddingHorizontal: 22, justifyContent: "center" },
+  discoveryLogo: { alignSelf: "center", width: 82, height: 82, borderRadius: 28, backgroundColor: C.green, alignItems: "center", justifyContent: "center", marginBottom: 18 },
+  logoInner: { width: 62, height: 62, borderRadius: 20, backgroundColor: C.black, alignItems: "center", justifyContent: "center" },
+  logoCross: { color: C.green, fontSize: 34 },
+  discoveryTitle: { color: C.text, fontSize: 30, fontWeight: "800", textAlign: "center" },
+  discoverySubtitle: { color: C.muted, textAlign: "center", marginTop: 4, marginBottom: 28, fontSize: 14 },
+  scannerCard: { backgroundColor: C.panel, borderRadius: 18, padding: 24, alignItems: "center", borderWidth: 1, borderColor: "#383838", marginBottom: 18 },
+  scannerTitle: { color: C.text, fontSize: 18, fontWeight: "800", marginTop: 15 },
+  scannerPhase: { color: C.muted, textAlign: "center", marginTop: 8, lineHeight: 20 },
+  scanLine: { width: "100%", height: 5, borderRadius: 3, backgroundColor: C.key, marginTop: 18, overflow: "hidden" },
+  scanProgress: { height: "100%", width: "65%", backgroundColor: C.green },
+  scannerHint: { color: "#8B8B8B", textAlign: "center", fontSize: 11, marginTop: 14, lineHeight: 16 },
+  primaryGreen: { minHeight: 50, borderRadius: 10, backgroundColor: C.green, alignItems: "center", justifyContent: "center", paddingHorizontal: 18, marginTop: 10 },
+  primaryGreenText: { color: C.black, fontWeight: "900", fontSize: 14, letterSpacing: 1.1 },
+  secondaryDark: { minHeight: 46, borderRadius: 10, backgroundColor: C.panel2, alignItems: "center", justifyContent: "center", paddingHorizontal: 18, marginTop: 8 },
+  secondaryDarkText: { color: C.text, fontWeight: "800", fontSize: 12, letterSpacing: .8 },
+  remoteScreen: { backgroundColor: C.bg, padding: 12, paddingBottom: 30 },
+  topBar: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 10 },
+  deviceBadge: { flexDirection: "row", alignItems: "center", gap: 9 },
+  deviceDot: { width: 10, height: 10, borderRadius: 5, backgroundColor: C.green },
+  deviceName: { color: C.text, fontSize: 16, fontWeight: "800" },
+  deviceIp: { color: C.muted, fontSize: 11, marginTop: 1 },
+  gear: { width: 42, height: 42, backgroundColor: C.panel, borderRadius: 12, alignItems: "center", justifyContent: "center" },
+  gearText: { color: C.text, fontSize: 20 },
+  modeRow: { flexDirection: "row", backgroundColor: C.panel, borderRadius: 10, padding: 3, marginBottom: 10 },
+  modeTab: { flex: 1, paddingVertical: 10, borderRadius: 8, alignItems: "center" },
+  modeTabActive: { backgroundColor: C.green },
+  modeTabText: { color: C.muted, fontWeight: "800", fontSize: 11 },
+  modeTabTextActive: { color: C.black },
+  functionRow: { flexDirection: "row", gap: 7, marginBottom: 9 },
+  keyButton: { flex: 1, minHeight: 48, borderRadius: 7, backgroundColor: C.key, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: "#444" },
+  keyButtonWide: { minWidth: 58 },
+  keyButtonGreen: { backgroundColor: C.greenDark, borderColor: C.green },
+  keyButtonPressed: { backgroundColor: C.keyPressed, transform: [{ scale: 0.98 }] },
+  keyText: { color: C.text, fontSize: 12, fontWeight: "900", letterSpacing: .35 },
+  dpadPanel: { backgroundColor: C.panel, borderRadius: 18, paddingVertical: 15, alignItems: "center", marginBottom: 10, borderWidth: 1, borderColor: "#383838" },
+  dpadMiddle: { flexDirection: "row", alignItems: "center", gap: 10, marginVertical: 10 },
+  arrowButton: { width: 70, height: 58, borderRadius: 15, backgroundColor: C.key, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: "#444" },
+  arrowText: { color: C.text, fontSize: 22, fontWeight: "900" },
+  okButton: { width: 76, height: 76, borderRadius: 38, backgroundColor: C.green, alignItems: "center", justifyContent: "center", borderWidth: 4, borderColor: "#A9D95C" },
+  okText: { color: C.black, fontSize: 17, fontWeight: "900" },
+  avRow: { flexDirection: "row", gap: 8, marginBottom: 12 },
+  levelBlock: { flex: 1, backgroundColor: C.panel, padding: 8, borderRadius: 12 },
+  levelTitle: { color: C.muted, fontSize: 10, fontWeight: "900", letterSpacing: 1, textAlign: "center", marginBottom: 6 },
+  levelRow: { flexDirection: "row", gap: 5 },
+  numericHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 6 },
+  sectionTitle: { color: C.text, fontWeight: "900", fontSize: 12 },
+  linkText: { color: C.green, fontSize: 10, fontWeight: "900" },
+  numericGrid: { flexDirection: "row", flexWrap: "wrap", gap: 7, marginBottom: 10 },
+  mediaRow: { flexDirection: "row", gap: 7, marginBottom: 8 },
+  colorRow: { flexDirection: "row", gap: 7 },
+  twoCol: { flexDirection: "row", gap: 8 },
+  trackpadWrap: { gap: 10 },
+  trackpadSurface: { height: 330, backgroundColor: C.panel, borderRadius: 20, borderWidth: 1, borderColor: "#3D3D3D", alignItems: "center", justifyContent: "center" },
+  trackpadIcon: { color: C.green, fontSize: 44, marginBottom: 10 },
+  trackpadText: { color: C.text, fontWeight: "900", letterSpacing: 1 },
+  trackpadSub: { color: C.muted, marginTop: 6 },
+  screenCard: { backgroundColor: C.panel, borderRadius: 18, padding: 26, alignItems: "center", minHeight: 430, justifyContent: "center" },
+  screenIcon: { color: C.green, fontSize: 52 },
+  screenTitle: { color: C.text, fontSize: 22, fontWeight: "900", marginTop: 10 },
+  screenBody: { color: C.muted, textAlign: "center", lineHeight: 20, marginVertical: 14 },
+  statusBar: { flexDirection: "row", alignItems: "center", backgroundColor: C.panel, borderRadius: 10, paddingHorizontal: 10, paddingVertical: 9, marginTop: 12 },
+  statusText: { color: C.text, fontSize: 11, flex: 1, marginLeft: 8 },
+  statusPort: { color: C.muted, fontSize: 10 },
+  modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,.68)", justifyContent: "flex-end" },
+  sheet: { backgroundColor: C.panel, borderTopLeftRadius: 22, borderTopRightRadius: 22, padding: 20, paddingBottom: 30 },
+  sheetTitle: { color: C.text, fontSize: 20, fontWeight: "900", marginBottom: 14 },
+  sheetLabel: { color: C.muted, fontSize: 11, fontWeight: "800", marginTop: 9, marginBottom: 5 },
+  input: { backgroundColor: C.key, borderRadius: 8, color: C.text, paddingHorizontal: 12, paddingVertical: 12 },
+  cancelText: { color: C.muted, fontWeight: "800", textAlign: "center", marginTop: 14, paddingVertical: 8 },
+  connectedLine: { color: C.green, fontSize: 12, fontWeight: "800", marginBottom: 8 },
+  channelBig: { color: C.text, fontSize: 40, fontWeight: "900", textAlign: "center", marginBottom: 12 },
 });
