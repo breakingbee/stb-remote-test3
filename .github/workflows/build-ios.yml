@@ -1,77 +1,96 @@
 name: Build iOS (unsigned IPA)
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-14
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Select Xcode 16
-        uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: latest-stable
 
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      - name: Install JS dependencies
-        run: npm install
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
 
-      - name: Expo prebuild (generate ios/ project)
-        run: npx expo prebuild -p ios --no-install
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Expo prebuild
+        run: npx expo prebuild --platform ios --no-install
 
       - name: Install CocoaPods
         run: |
           cd ios
-          pod install --repo-update
+          pod install
 
-      - name: Detect workspace and scheme
-        id: xcode
+      - name: Verify iOS workspace
         run: |
-          cd ios
-          WORKSPACE=$(ls *.xcworkspace | head -n 1)
-          SCHEME=$(xcodebuild -list -workspace "$WORKSPACE" -json \
-            | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>console.log(JSON.parse(d).workspace.schemes[0]))")
-          echo "workspace=$WORKSPACE" >> "$GITHUB_OUTPUT"
-          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
-          echo "Workspace: $WORKSPACE"
-          echo "Scheme: $SCHEME"
+          echo "iOS contents:"
+          find ios -maxdepth 2 -type f | sort
 
-      - name: Archive (unsigned)
+          WORKSPACE=$(find ios -maxdepth 1 -name "*.xcworkspace" -type d -print -quit)
+
+          if [ -z "$WORKSPACE" ]; then
+            echo "ERROR: No .xcworkspace found"
+            exit 1
+          fi
+
+          if [ ! -f "$WORKSPACE/contents.xcworkspacedata" ]; then
+            echo "ERROR: Workspace exists but contents.xcworkspacedata is missing:"
+            echo "$WORKSPACE"
+            exit 1
+          fi
+
+          echo "Workspace:"
+          echo "$WORKSPACE"
+
+      - name: Build unsigned archive
         run: |
-          cd ios
-          xcodebuild archive \
-            -workspace "${{ steps.xcode.outputs.workspace }}" \
-            -scheme "${{ steps.xcode.outputs.scheme }}" \
+          WORKSPACE=$(find ios -maxdepth 1 -name "*.xcworkspace" -type d -print -quit)
+
+          xcodebuild \
+            -workspace "$WORKSPACE" \
+            -scheme "STBRemote" \
             -configuration Release \
             -sdk iphoneos \
-            -archivePath "$PWD/build/App.xcarchive" \
             -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/STBRemote.xcarchive" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES \
-            DEVELOPMENT_TEAM=""
+            archive
 
-      - name: Package unsigned IPA
+      - name: Create unsigned IPA
         run: |
-          cd ios/build
-          mkdir -p Payload
-          cp -r App.xcarchive/Products/Applications/*.app Payload/
-          zip -r ../StbRemote-unsigned.ipa Payload
+          APP_PATH=$(find "$RUNNER_TEMP/STBRemote.xcarchive/Products/Applications" \
+            -maxdepth 1 \
+            -type d \
+            -name "*.app" \
+            -print -quit)
 
-      - name: Upload IPA artifact
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: No .app found"
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$APP_PATH" "$RUNNER_TEMP/Payload/"
+
+          cd "$RUNNER_TEMP"
+          zip -r "StbRemote-unsigned.ipa" Payload
+
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
           name: StbRemote-unsigned-ipa
-          path: ios/StbRemote-unsigned.ipa
+          path: ${{ runner.temp }}/StbRemote-unsigned.ipa
           retention-days: 14
