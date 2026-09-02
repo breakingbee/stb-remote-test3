@@ -26,13 +26,16 @@ export default function DebugScreen() {
 
   useEffect(() => subscribeDiscoveryLogs(setLogs), []);
 
+  const newestFirst = [...logs].reverse();
+  const latest = newestFirst[0];
+
   return (
     <ScreenContainer edges={["top", "left", "right", "bottom"]} containerClassName="bg-background">
       <View style={styles.header}>
-        <View>
+        <View style={{ flex: 1 }}>
           <Text style={styles.kicker}>STB REMOTE</Text>
           <Text style={styles.title}>Discovery Log</Text>
-          <Text style={styles.subtitle}>Live view of what the iPhone is actually doing on startup.</Text>
+          <Text style={styles.subtitle}>Live network diagnostics. Newest event is always at the top.</Text>
         </View>
         <Pressable onPress={clearDiscoveryLogs} style={styles.clearButton}>
           <Text style={styles.clearText}>CLEAR</Text>
@@ -41,16 +44,19 @@ export default function DebugScreen() {
 
       <View style={styles.summary}>
         <Text style={styles.summaryText}>{logs.length} events recorded</Text>
-        <Text style={styles.summaryText}>Open Home to start another scan.</Text>
+        <Text style={styles.latestLabel}>LATEST</Text>
+        <Text style={styles.latestText}>{latest?.message ?? "No discovery activity yet."}</Text>
       </View>
 
       <ScrollView style={styles.logPanel} contentContainerStyle={styles.logContent} showsVerticalScrollIndicator>
-        {logs.length === 0 ? (
+        {newestFirst.length === 0 ? (
           <Text style={styles.empty}>No discovery events yet.</Text>
-        ) : logs.map((entry, index) => (
+        ) : newestFirst.map((entry, index) => (
           <View key={`${entry.time}-${index}`} style={styles.row}>
-            <Text style={styles.time}>{entry.time}</Text>
-            <Text style={[styles.level, { color: levelColor(entry.level) }]}>{entry.level.toUpperCase()}</Text>
+            <View style={styles.metaRow}>
+              <Text style={styles.time}>{entry.time}</Text>
+              <Text style={[styles.level, { color: levelColor(entry.level) }]}>{entry.level.toUpperCase()}</Text>
+            </View>
             <Text style={styles.message}>{entry.message}</Text>
           </View>
         ))}
@@ -63,16 +69,19 @@ const styles = StyleSheet.create({
   header: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", paddingHorizontal: 18, paddingTop: 16, paddingBottom: 14 },
   kicker: { color: colors.green, fontSize: 10, fontWeight: "800", letterSpacing: 1.6 },
   title: { color: colors.text, fontSize: 28, fontWeight: "800", marginTop: 3 },
-  subtitle: { color: colors.muted, fontSize: 12, marginTop: 5, maxWidth: 280, lineHeight: 17 },
-  clearButton: { borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panel, paddingHorizontal: 12, paddingVertical: 9, borderRadius: 10 },
+  subtitle: { color: colors.muted, fontSize: 12, marginTop: 5, maxWidth: 310, lineHeight: 17 },
+  clearButton: { borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panel, paddingHorizontal: 12, paddingVertical: 9, borderRadius: 10, marginLeft: 10 },
   clearText: { color: colors.text, fontSize: 11, fontWeight: "800" },
   summary: { marginHorizontal: 18, marginBottom: 10, padding: 12, borderRadius: 12, backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border },
-  summaryText: { color: colors.muted, fontSize: 11, marginVertical: 2 },
-  logPanel: { marginHorizontal: 18, marginBottom: 18, backgroundColor: colors.panel, borderRadius: 14, borderWidth: 1, borderColor: colors.border },
+  summaryText: { color: colors.muted, fontSize: 11, marginBottom: 5 },
+  latestLabel: { color: colors.green, fontSize: 9, fontWeight: "900", letterSpacing: 1.2 },
+  latestText: { color: colors.text, fontSize: 12, lineHeight: 17, marginTop: 3 },
+  logPanel: { flex: 1, marginHorizontal: 18, marginBottom: 18, backgroundColor: colors.panel, borderRadius: 14, borderWidth: 1, borderColor: colors.border },
   logContent: { padding: 12 },
-  row: { paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: colors.border },
+  row: { paddingVertical: 9, borderBottomWidth: 1, borderBottomColor: colors.border },
+  metaRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   time: { color: "#7F8895", fontSize: 10, fontVariant: ["tabular-nums"] },
-  level: { fontSize: 9, fontWeight: "800", marginTop: 2 },
-  message: { color: colors.text, fontSize: 12, lineHeight: 17, marginTop: 2 },
+  level: { fontSize: 9, fontWeight: "800" },
+  message: { color: colors.text, fontSize: 12, lineHeight: 17, marginTop: 3 },
   empty: { color: colors.muted, fontSize: 13, padding: 10 },
 });
