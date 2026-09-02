@@ -29,13 +29,13 @@ type Socket = {
   ) => void;
 };
 
-type Dgram = {
-  createSocket: (options: { type: "udp4" }) => Socket;
-};
+type Dgram = { createSocket: (options: { type: "udp4" }) => Socket };
+
+const HI_HTTP_PORTS = [2015, 8867];
+const HI_DESCRIPTION_PATHS = ["/desc.xml", "/description.xml", "/device.xml"];
 
 function loadDgram(): Dgram | null {
   if (Platform.OS === "web") return null;
-
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     return require("react-native-udp").default ?? require("react-native-udp");
@@ -71,21 +71,39 @@ function normalizeHost(host: string) {
   return host.trim().replace(/^\[|\]$/g, "");
 }
 
-async function resolveDevice(
-  host: string,
-  location?: string,
-  server?: string,
-): Promise<StbDevice> {
+async function fetchDescription(url: string): Promise<string> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 700);
+    const response = await fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!response.ok) return "";
+    const text = await response.text();
+    return /<(?:root|device)\b/i.test(text) && /<serviceType>/i.test(text) ? text : "";
+  } catch {
+    return "";
+  }
+}
+
+async function resolveDevice(host: string, location?: string, server?: string): Promise<StbDevice> {
   let descriptionXml = "";
+  let descriptionUrl = location;
 
   if (location) {
-    try {
-      const response = await fetch(location);
-      if (response.ok) {
-        descriptionXml = await response.text();
+    descriptionXml = await fetchDescription(location);
+  }
+
+  if (!descriptionXml) {
+    for (const port of HI_HTTP_PORTS) {
+      for (const path of HI_DESCRIPTION_PATHS) {
+        const candidate = `http://${host}:${port}${path}`;
+        descriptionXml = await fetchDescription(candidate);
+        if (descriptionXml) {
+          descriptionUrl = candidate;
+          break;
+        }
       }
-    } catch {
-      // Keep fallback below.
+      if (descriptionXml) break;
     }
   }
 
@@ -94,105 +112,58 @@ async function resolveDevice(
       id: `${host}-fallback`,
       name: server?.split("/")[0] ?? "HiSilicon STB",
       host,
-      vinput: {
-        host,
-        port: VINPUT_DEFAULT_PORT,
-        serviceName: VINPUT_SERVICE_TYPE,
-      },
+      vinput: { host, port: VINPUT_DEFAULT_PORT, serviceName: VINPUT_SERVICE_TYPE },
     };
   }
 
-  const parsed = parseDeviceDescription(
-    descriptionXml,
-    location ?? `http://${host}/`,
-  );
-
-  const vinputService = parsed.services.find(
-    (service) => service.serviceType === VINPUT_SERVICE_TYPE,
-  );
-
-  const accessService = parsed.services.find((service) =>
-    service.serviceType.includes("AccessControlServer"),
-  );
-
-  const mirrorService = parsed.services.find((service) =>
-    service.serviceType.includes("MirrorControlServer"),
-  );
+  const parsed = parseDeviceDescription(descriptionXml, descriptionUrl ?? `http://${host}/`);
+  const vinputService = parsed.services.find((service) => service.serviceType === VINPUT_SERVICE_TYPE);
+  const accessService = parsed.services.find((service) => service.serviceType.includes("AccessControlServer"));
+  const mirrorService = parsed.services.find((service) => service.serviceType.includes("MirrorControlServer"));
 
   return {
     id: parsed.udn ?? `${host}-${vinputService ? "vinput" : "unknown"}`,
     name: parsed.friendlyName ?? server?.split("/")[0] ?? "HiSilicon STB",
     host,
     udn: parsed.udn,
-    descriptionUrl: location,
+    descriptionUrl,
     services: {
-      access: accessService
-        ? { controlUrl: accessService.controlUrl }
-        : undefined,
-      vinput: vinputService
-        ? { controlUrl: vinputService.controlUrl }
-        : undefined,
-      mirror: mirrorService
-        ? { controlUrl: mirrorService.controlUrl }
-        : undefined,
+      access: accessService ? { controlUrl: accessService.controlUrl } : undefined,
+      vinput: vinputService ? { controlUrl: vinputService.controlUrl } : undefined,
+      mirror: mirrorService ? { controlUrl: mirrorService.controlUrl } : undefined,
     },
-    vinput: {
-      host,
-      port: VINPUT_DEFAULT_PORT,
-      serviceName: VINPUT_SERVICE_TYPE,
-    },
+    vinput: { host, port: VINPUT_DEFAULT_PORT, serviceName: VINPUT_SERVICE_TYPE },
   };
 }
 
-async function ssdpSearch(
-  destinations: string[],
-  timeoutMs: number,
-): Promise<Map<string, { location?: string; server?: string }>> {
+async function ssdpSearch(destinations: string[], timeoutMs: number) {
   const dgram = loadDgram();
-  if (!dgram) return new Map();
+  if (!dgram) return new Map<string, { location?: string; server?: string }>();
 
   const socket = dgram.createSocket({ type: "udp4" });
   const responses = new Map<string, { location?: string; server?: string }>();
   const request = buildSearchRequest();
 
-  return new Promise((resolve) => {
+  return new Promise<Map<string, { location?: string; server?: string }>>((resolve) => {
     let finished = false;
-
     const finish = () => {
       if (finished) return;
       finished = true;
-      try {
-        socket.close();
-      } catch {
-        // Ignore close errors.
-      }
+      try { socket.close(); } catch { /* ignore */ }
       resolve(responses);
     };
 
     socket.on("message", (message, remote) => {
       const text = decodeMessage(message);
-      const host = normalizeHost(remote.address);
-
-      responses.set(host, {
+      responses.set(normalizeHost(remote.address), {
         location: header(text, "LOCATION"),
         server: header(text, "SERVER"),
       });
     });
 
-    // IMPORTANT: wait for bind before sending. The previous implementation
-    // could call send() before react-native-udp had finished binding.
     socket.bind(0, "0.0.0.0", () => {
       for (const destination of destinations) {
-        socket.send(
-          request,
-          0,
-          request.length,
-          1900,
-          destination,
-          () => {
-            // Ignore individual UDP send errors and continue discovery.
-          },
-        );
+        socket.send(request, 0, request.length, 1900, destination, () => undefined);
       }
     });
 
@@ -200,59 +171,76 @@ async function ssdpSearch(
   });
 }
 
-/**
- * Discover HiSilicon MultiScreen STBs.
- *
- * First uses standard SSDP multicast. If iOS multicast is unavailable,
- * falls back to unicast M-SEARCH probes across the local IPv4 /24.
- */
-export async function discoverHiSiliconStbs(
-  timeoutMs = 2500,
-): Promise<StbDevice[]> {
-  const multicastResponses = await ssdpSearch(
-    ["239.255.255.250"],
-    timeoutMs,
-  );
+async function probeHttpHosts(localIp: string, timeoutMs: number): Promise<string[]> {
+  const parts = localIp.split(".");
+  if (parts.length !== 4) return [];
+  const prefix = parts.slice(0, 3).join(".");
+  const hosts = Array.from({ length: 254 }, (_, i) => `${prefix}.${i + 1}`).filter((ip) => ip !== localIp);
+  const found = new Set<string>();
 
+  for (let i = 0; i < hosts.length; i += 32) {
+    const batch = hosts.slice(i, i + 32);
+    await Promise.all(
+      batch.map(async (host) => {
+        for (const port of HI_HTTP_PORTS) {
+          for (const path of HI_DESCRIPTION_PATHS) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+              const response = await fetch(`http://${host}:${port}${path}`, { signal: controller.signal });
+              if (!response.ok) continue;
+              const text = await response.text();
+              if (/<(?:root|device)\b/i.test(text) && /<serviceType>/i.test(text)) {
+                found.add(host);
+                return;
+              }
+            } catch {
+              // Host/port is simply not our STB.
+            } finally {
+              clearTimeout(timer);
+            }
+          }
+        }
+      }),
+    );
+    if (found.size > 0) break;
+  }
+
+  return [...found];
+}
+
+export async function discoverHiSiliconStbs(timeoutMs = 2500): Promise<StbDevice[]> {
+  const multicastResponses = await ssdpSearch(["239.255.255.250"], timeoutMs);
   const responses = new Map(multicastResponses);
 
-  // Multicast may be unavailable on a free-signed iOS app. Use ordinary
-  // unicast UDP as a fallback, which does not require the multicast entitlement.
   if (responses.size === 0) {
     try {
       const localIp = await Network.getIpAddressAsync();
-
       if (localIp && /^\d+\.\d+\.\d+\.\d+$/.test(localIp)) {
         const parts = localIp.split(".");
         const prefix = parts.slice(0, 3).join(".");
-
-        const destinations = Array.from(
-          { length: 254 },
-          (_, index) => `${prefix}.${index + 1}`,
-        ).filter((ip) => ip !== localIp);
-
-        // Probe in batches so discovery doesn't create hundreds of sockets.
+        const destinations = Array.from({ length: 254 }, (_, index) => `${prefix}.${index + 1}`).filter((ip) => ip !== localIp);
         for (let i = 0; i < destinations.length; i += 32) {
-          const batch = destinations.slice(i, i + 32);
-          const batchResponses = await ssdpSearch(batch, 1000);
-
-          for (const [host, info] of batchResponses) {
-            responses.set(host, info);
-          }
-
+          const batchResponses = await ssdpSearch(destinations.slice(i, i + 32), 1000);
+          for (const [host, info] of batchResponses) responses.set(host, info);
           if (responses.size > 0) break;
+        }
+
+        // Some HiSilicon firmware does not answer SSDP M-SEARCH at all, but still
+        // exposes the MultiScreen HTTP descriptor on 2015/8867. Probe those ports
+        // as a final unicast fallback so discovery works on iOS without multicast entitlements.
+        if (responses.size === 0) {
+          for (const host of await probeHttpHosts(localIp, 450)) {
+            responses.set(host, { server: "HiMultiScreenHTTP" });
+          }
         }
       }
     } catch {
-      // Keep multicast results, if any.
+      // Keep any multicast results.
     }
   }
 
-  const devices = await Promise.all(
-    Array.from(responses.entries()).map(([host, info]) =>
-      resolveDevice(host, info.location, info.server),
-    ),
+  return Promise.all(
+    Array.from(responses.entries()).map(([host, info]) => resolveDevice(host, info.location, info.server)),
   );
-
-  return devices;
 }
